@@ -5,6 +5,8 @@ from typing import List, Union, Dict, Any, Optional
 import requests
 import os
 import json
+import time
+import asyncio
 from dotenv import load_dotenv
 from fastapi.staticfiles import StaticFiles
 import os
@@ -72,17 +74,28 @@ async def generate_chat(request: ChatRequest):
         "temperature": request.temperature
     }
 
-    try:
-        response = requests.post(url, headers=headers, json=payload)
-        response.raise_for_status()
-        data = response.json()
-        if "choices" in data and len(data["choices"]) > 0:
-            return ChatResponse(generated_text=data["choices"][0]["message"]["content"])
-        else:
-            return ChatResponse(generated_text=str(data))
-    except Exception as e:
-        error_details = response.text if 'response' in locals() else str(e)
-        raise HTTPException(status_code=500, detail=f"Baseten Error: {error_details}")
+    max_retries = 30 # Hasta 5 minutos de espera
+    retry_delay = 10 # Segundos
+    
+    for attempt in range(max_retries):
+        try:
+            response = requests.post(url, headers=headers, json=payload)
+            response.raise_for_status()
+            data = response.json()
+            if "choices" in data and len(data["choices"]) > 0:
+                return ChatResponse(generated_text=data["choices"][0]["message"]["content"])
+            else:
+                return ChatResponse(generated_text=str(data))
+        except Exception as e:
+            error_details = response.text if 'response' in locals() else str(e)
+            # Si el error menciona que el modelo está despertando o hay error de servidor, reintentamos
+            if "Model is unhealthy" in error_details or response.status_code in [500, 502, 503, 504]:
+                if attempt < max_retries - 1:
+                    print(f"Cold Start detectado. Esperando {retry_delay}s... (Intento {attempt + 1}/{max_retries})")
+                    time.sleep(retry_delay)
+                    continue
+            # Si es un error distinto o se acabaron los intentos, lanzamos la excepcion
+            raise HTTPException(status_code=500, detail=f"Baseten Error: {error_details}")
 
 @app.post("/chat/stream")
 async def generate_chat_stream(request: ChatRequest):
@@ -101,27 +114,47 @@ async def generate_chat_stream(request: ChatRequest):
     }
 
     def event_stream():
-        try:
-            with requests.post(url, headers=headers, json=payload, stream=True) as response:
-                response.raise_for_status()
-                for line in response.iter_lines():
-                    if line:
-                        decoded_line = line.decode("utf-8")
-                        if decoded_line.startswith("data: "):
-                            json_str = decoded_line.replace("data: ", "")
-                            if json_str == "[DONE]":
-                                break
-                            try:
-                                chunk = json.loads(json_str)
-                                if "choices" in chunk and len(chunk["choices"]) > 0:
-                                    delta = chunk["choices"][0].get("delta", {})
-                                    content = delta.get("content", "")
-                                    if content:
-                                        yield content
-                            except json.JSONDecodeError:
-                                pass
-        except Exception as e:
-            yield f"\n\n[Error: {str(e)}]"
+        max_retries = 30
+        retry_delay = 10
+        
+        for attempt in range(max_retries):
+            try:
+                with requests.post(url, headers=headers, json=payload, stream=True) as response:
+                    # Chequear si hay error de Cold Start
+                    if response.status_code in [500, 502, 503, 504] or not response.ok:
+                        error_details = response.text
+                        if "Model is unhealthy" in error_details or response.status_code >= 500:
+                            if attempt < max_retries - 1:
+                                print(f"Cold Start detectado en Stream. Esperando {retry_delay}s... (Intento {attempt + 1}/{max_retries})")
+                                time.sleep(retry_delay)
+                                continue
+                    
+                    response.raise_for_status()
+                    # Si llego aca, el modelo esta sano
+                    for line in response.iter_lines():
+                        if line:
+                            decoded_line = line.decode("utf-8")
+                            if decoded_line.startswith("data: "):
+                                json_str = decoded_line.replace("data: ", "")
+                                if json_str == "[DONE]":
+                                    break
+                                try:
+                                    chunk = json.loads(json_str)
+                                    if "choices" in chunk and len(chunk["choices"]) > 0:
+                                        delta = chunk["choices"][0].get("delta", {})
+                                        content = delta.get("content", "")
+                                        if content:
+                                            yield content
+                                except json.JSONDecodeError:
+                                    pass
+                    return # Salimos de la funcion si el stream termino con exito
+            except Exception as e:
+                # Si falló la conexión completamente, reintenta
+                if attempt < max_retries - 1:
+                    time.sleep(retry_delay)
+                    continue
+                yield f"\\n\\n[Error: {str(e)}]"
+                return
 
     return StreamingResponse(event_stream(), media_type="text/event-stream")
 
