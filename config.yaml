@@ -1,0 +1,14 @@
+model_name: MedGemma-4B
+
+environment_variables:
+  HUGGING_FACE_HUB_TOKEN: ""
+
+build:
+  model_server: TRT_LLM
+
+model_metadata:
+  huggingface_model_id: google/medgemma-1.5-4b-it
+
+resources:
+  accelerator: L4
+  use_gpu: true
